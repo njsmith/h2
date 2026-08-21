@@ -999,20 +999,21 @@ async fn rst_stream_expires() {
         srv.send_frame(frames::headers(1).response(200)).await;
         srv.send_frame(frames::data(1, vec![0; 16_384])).await;
         srv.recv_frame(frames::reset(1).cancel()).await;
-        // wait till after the configured duration
-        idle_ms(15).await;
-        srv.ping_pong([1; 8]).await;
-        // sending frame after canceled!
-        srv.send_frame(frames::data(1, vec![0; 16_384]).eos()).await;
+        // still tracked just before the deadline: frame is swallowed
+        idle_ms(995).await;
+        srv.send_frame(frames::data(1, vec![0; 16_384])).await;
         // window capacity is returned
         srv.recv_frame(frames::window_update(0, 16_384 * 2)).await;
-        // and then stream error
+        srv.ping_pong([1; 8]).await;
+        // past the deadline: stream is forgotten
+        idle_ms(10).await;
+        srv.send_frame(frames::data(1, vec![0; 16_384]).eos()).await;
         srv.recv_frame(frames::reset(1).stream_closed()).await;
     };
 
     let client = async move {
         let (mut client, conn) = client::Builder::new()
-            .reset_stream_duration(Duration::from_millis(10))
+            .reset_stream_duration(Duration::from_secs(1))
             .handshake::<_, Bytes>(io)
             .await
             .expect("handshake");
@@ -1097,6 +1098,192 @@ async fn rst_stream_max() {
             conn.await.expect("client");
         });
         conn.drive(join(req1, req2)).await;
+        conn.await;
+        drop(client);
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn rst_stream_max_slot_freed_after_expiry() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.recv_frame(
+            frames::headers(3)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200)).await;
+        srv.recv_frame(frames::reset(1).cancel()).await;
+        // let the reset on 1 expire, freeing the only slot
+        idle_ms(1005).await;
+        srv.send_frame(frames::headers(3).response(200)).await;
+        srv.recv_frame(frames::reset(3).cancel()).await;
+        // 3 got the slot and is being ignored
+        srv.send_frame(frames::data(3, vec![0; 16]).eos()).await;
+        srv.ping_pong([1; 8]).await;
+        // 1 has been forgotten, will get a reset
+        srv.send_frame(frames::data(1, vec![0; 16]).eos()).await;
+        srv.recv_frame(frames::reset(1).stream_closed()).await;
+    };
+
+    let client = async move {
+        let (mut client, conn) = client::Builder::new()
+            .max_concurrent_reset_streams(1)
+            .reset_stream_duration(Duration::from_secs(1))
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("handshake");
+        let req1 = client.get("https://example.com/");
+        let req2 = client.get("https://example.com/");
+        let reqs = async move {
+            // dropping each response sends a reset
+            req1.await.expect("response1");
+            req2.await.expect("response2");
+        };
+
+        // no connection error should happen
+        let mut conn = Box::pin(async move {
+            conn.await.expect("client");
+        });
+        conn.drive(reqs).await;
+        conn.await;
+        drop(client);
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn rst_stream_max_slot_not_freed_before_expiry() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.recv_frame(
+            frames::headers(3)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200)).await;
+        srv.recv_frame(frames::reset(1).cancel()).await;
+        // reset on 1 has not expired yet, so the only slot is still taken
+        idle_ms(995).await;
+        srv.send_frame(frames::headers(3).response(200)).await;
+        srv.recv_frame(frames::reset(3).cancel()).await;
+        // 1 is still being ignored
+        srv.send_frame(frames::data(1, vec![0; 16]).eos()).await;
+        srv.ping_pong([1; 8]).await;
+        // 3 has been evicted, will get a reset
+        srv.send_frame(frames::data(3, vec![0; 16]).eos()).await;
+        srv.recv_frame(frames::reset(3).stream_closed()).await;
+    };
+
+    let client = async move {
+        let (mut client, conn) = client::Builder::new()
+            .max_concurrent_reset_streams(1)
+            .reset_stream_duration(Duration::from_secs(1))
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("handshake");
+        let req1 = client.get("https://example.com/");
+        let req2 = client.get("https://example.com/");
+        let reqs = async move {
+            // dropping each response sends a reset
+            req1.await.expect("response1");
+            req2.await.expect("response2");
+        };
+
+        // no connection error should happen
+        let mut conn = Box::pin(async move {
+            conn.await.expect("client");
+        });
+        conn.drive(reqs).await;
+        conn.await;
+        drop(client);
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn rst_streams_expire_in_order() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.recv_frame(
+            frames::headers(3)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        // 1 is reset at t=0, 3 at t=500ms
+        srv.send_frame(frames::headers(1).response(200)).await;
+        srv.recv_frame(frames::reset(1).cancel()).await;
+        idle_ms(500).await;
+        srv.send_frame(frames::headers(3).response(200)).await;
+        srv.recv_frame(frames::reset(3).cancel()).await;
+        // t=1005ms: 1 has expired, 3 has not
+        idle_ms(505).await;
+        srv.send_frame(frames::data(3, vec![0; 16])).await;
+        srv.ping_pong([1; 8]).await;
+        srv.send_frame(frames::data(1, vec![0; 16]).eos()).await;
+        srv.recv_frame(frames::reset(1).stream_closed()).await;
+        // t=1510ms: 3 has expired too
+        idle_ms(505).await;
+        srv.send_frame(frames::data(3, vec![0; 16]).eos()).await;
+        srv.recv_frame(frames::reset(3).stream_closed()).await;
+    };
+
+    let client = async move {
+        let (mut client, conn) = client::Builder::new()
+            .reset_stream_duration(Duration::from_secs(1))
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("handshake");
+        let req1 = client.get("https://example.com/");
+        let req2 = client.get("https://example.com/");
+        let reqs = async move {
+            // dropping each response sends a reset
+            req1.await.expect("response1");
+            req2.await.expect("response2");
+        };
+
+        // no connection error should happen
+        let mut conn = Box::pin(async move {
+            conn.await.expect("client");
+        });
+        conn.drive(reqs).await;
         conn.await;
         drop(client);
     };
